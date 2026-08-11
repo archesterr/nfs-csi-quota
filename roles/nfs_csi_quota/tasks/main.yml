@@ -1,0 +1,258 @@
+---
+# nfs-csi-quota: ext4 project quotas enforcing per-PVC capacity for
+# csi-driver-nfs (github.com/kubernetes-csi/csi-driver-nfs), which has no
+# native capacity enforcement of its own — spec.capacity is used only for
+# PV/PVC matching, never enforced by NFS itself. This role runs entirely
+# on the NFS server; RBAC on the cluster side lives in manifests/rbac/.
+
+- name: Guards
+  tags: [nfs_csi_quota]
+  block:
+    - name: Fail if nfs_csi_quota_export_path's host is not this host
+      ansible.builtin.fail:
+        msg: "This role must run on the actual NFS export server."
+      when: not (ansible_mounts | selectattr('mount', 'equalto', nfs_csi_quota_export_path) | list | length > 0)
+
+    - name: End host if nfs_csi_quota_enabled is false
+      ansible.builtin.meta: end_host
+      when: not ((nfs_csi_quota_enabled | default(false)) | bool)
+
+    - name: Validate nfs_csi_quota_mode
+      ansible.builtin.assert:
+        that: nfs_csi_quota_mode in ['alert', 'enforce']
+        fail_msg: "nfs_csi_quota_mode must be 'alert' or 'enforce'."
+
+    - name: Detect NFS service name (Debian/Ubuntu vs RHEL)
+      ansible.builtin.set_fact:
+        nfs_csi_quota_service_name_effective: >-
+          {{ (nfs_csi_quota_service_name | default('') | length > 0)
+             | ternary(nfs_csi_quota_service_name,
+               ('nfs-kernel-server' if ansible_facts['os_family'] == 'Debian' else 'nfs-server')) }}
+
+- name: pv-reader kubeconfig (RBAC itself is applied separately — see manifests/rbac/)
+  ansible.builtin.import_tasks: pv-reader.yml
+
+- name: Preflight
+  tags: [nfs_csi_quota, nfs-csi-quota-preflight]
+  block:
+    - name: Install quota tooling
+      ansible.builtin.package:
+        name: [quota, jq]
+        state: present
+
+    - name: Read export filesystem type and mount options
+      ansible.builtin.command: "findmnt -no FSTYPE,OPTIONS {{ nfs_csi_quota_export_path }}"
+      register: nfs_csi_quota_findmnt
+      changed_when: false
+
+    - name: Ensure export filesystem is ext4
+      ansible.builtin.assert:
+        that: nfs_csi_quota_findmnt.stdout.split()[0] == "ext4"
+        fail_msg: >-
+          nfs-csi-quota implements ext4 project quotas; export fs is
+          {{ nfs_csi_quota_findmnt.stdout.split()[0] }}. XFS project
+          quotas would need a different implementation (contributions
+          welcome — see CONTRIBUTING.md).
+
+    - name: Fail if pv-reader kubeconfig is missing
+      ansible.builtin.stat:
+        path: "{{ nfs_csi_quota_kubeconfig }}"
+      register: nfs_csi_quota_kubeconfig_stat
+      failed_when: not nfs_csi_quota_kubeconfig_stat.stat.exists
+
+# ==========================================================
+# FILESYSTEM: ext4 PROJECT QUOTA FEATURE
+# ==========================================================
+- name: ext4 project quota feature
+  tags: [nfs_csi_quota, nfs-csi-quota-fs]
+  block:
+    - name: Read ext4 features
+      ansible.builtin.command: "tune2fs -l {{ nfs_csi_quota_lv_path }}"
+      register: nfs_csi_quota_tune2fs
+      changed_when: false
+
+    - name: Decide if project quota is already active
+      ansible.builtin.set_fact:
+        nfs_csi_quota_fs_ready: >-
+          {{ ('project' in nfs_csi_quota_tune2fs.stdout) and ('prjquota' in nfs_csi_quota_findmnt.stdout) }}
+
+    - name: Fail if project quota missing and offline enable not allowed
+      ansible.builtin.fail:
+        msg: >-
+          Export fs lacks project quota (feature or prjquota mount opt).
+          Re-run with -e nfs_csi_quota_allow_offline_enable=true to allow
+          the offline enable (stops NFS, umounts {{ nfs_csi_quota_export_path }},
+          runs e2fsck + tune2fs, remounts). Clients with hard NFS mounts
+          stall and recover; this is real downtime, schedule it.
+      when:
+        - not (nfs_csi_quota_fs_ready | bool)
+        - not ((nfs_csi_quota_allow_offline_enable | default(false)) | bool)
+
+    - name: Offline enable of ext4 project quota
+      when:
+        - not (nfs_csi_quota_fs_ready | bool)
+        - (nfs_csi_quota_allow_offline_enable | default(false)) | bool
+      block:
+        - name: Stop NFS service
+          ansible.builtin.service:
+            name: "{{ nfs_csi_quota_service_name_effective }}"
+            state: stopped
+
+        - name: Unmount export filesystem
+          ansible.posix.mount:
+            path: "{{ nfs_csi_quota_export_path }}"
+            state: unmounted
+
+        - name: Run e2fsck (required before tune2fs -Q)
+          ansible.builtin.command: "e2fsck -f -y {{ nfs_csi_quota_lv_path }}"
+          register: nfs_csi_quota_e2fsck
+          changed_when: true
+          failed_when: nfs_csi_quota_e2fsck.rc not in [0, 1]
+
+        - name: Enable project + quota features
+          ansible.builtin.command: "tune2fs -O project,quota -Q prjquota {{ nfs_csi_quota_lv_path }}"
+          changed_when: true
+
+        - name: Get filesystem UUID
+          ansible.builtin.command: "blkid -s UUID -o value {{ nfs_csi_quota_lv_path }}"
+          register: nfs_csi_quota_lv_uuid
+          changed_when: false
+
+        - name: Mount export with prjquota (updates fstab)
+          ansible.posix.mount:
+            path: "{{ nfs_csi_quota_export_path }}"
+            src: "UUID={{ nfs_csi_quota_lv_uuid.stdout }}"
+            fstype: ext4
+            opts: "{{ nfs_csi_quota_mount_opts }}"
+            state: mounted
+
+        - name: Start NFS service
+          ansible.builtin.service:
+            name: "{{ nfs_csi_quota_service_name_effective }}"
+            state: started
+
+        - name: Re-apply exports (best effort)
+          ansible.builtin.shell: |
+            set -euo pipefail
+            command -v exportfs >/dev/null 2>&1 && exportfs -rav || echo "WARN: exportfs not found; skipping."
+          args:
+            executable: /bin/bash
+          changed_when: false
+          failed_when: false
+
+    - name: Verify project quota is active
+      ansible.builtin.command: "repquota -P {{ nfs_csi_quota_export_path }}"
+      changed_when: false
+
+# ==========================================================
+# KUBECTL
+# ==========================================================
+- name: kubectl binary
+  tags: [nfs_csi_quota, nfs-csi-quota-kubectl]
+  block:
+    - name: Check current kubectl version
+      ansible.builtin.command: "{{ nfs_csi_quota_kubectl_bin_path }} version --client=true"
+      register: nfs_csi_quota_kubectl_version_check
+      changed_when: false
+      failed_when: false
+      when: (nfs_csi_quota_kubectl_install_enabled | default(true)) | bool
+
+    - name: Download kubectl
+      ansible.builtin.get_url:
+        url: "{{ nfs_csi_quota_kubectl_download_url }}"
+        dest: "{{ nfs_csi_quota_kubectl_bin_path }}"
+        mode: "0755"
+        force: true
+      when:
+        - (nfs_csi_quota_kubectl_install_enabled | default(true)) | bool
+        - (nfs_csi_quota_kubectl_version_check.rc != 0) or (nfs_csi_quota_kube_version not in nfs_csi_quota_kubectl_version_check.stdout)
+
+# ==========================================================
+# SYNC SCRIPT + SYSTEMD TIMER
+# ==========================================================
+- name: Sync script + timer
+  tags: [nfs_csi_quota, nfs-csi-quota-sync]
+  block:
+    - name: Deploy quota sync script
+      ansible.builtin.template:
+        src: nfs-csi-quota-sync.sh.j2
+        dest: /usr/local/bin/nfs-csi-quota-sync.sh
+        owner: root
+        group: root
+        mode: "0700"
+      notify: restart nfs-csi-quota-sync
+
+    - name: Deploy sync service unit
+      ansible.builtin.template:
+        src: nfs-csi-quota-sync.service.j2
+        dest: /etc/systemd/system/nfs-csi-quota-sync.service
+        mode: "0644"
+      register: nfs_csi_quota_service_unit
+      notify: restart nfs-csi-quota-sync
+
+    - name: Deploy sync timer unit
+      ansible.builtin.template:
+        src: nfs-csi-quota-sync.timer.j2
+        dest: /etc/systemd/system/nfs-csi-quota-sync.timer
+        mode: "0644"
+      register: nfs_csi_quota_timer_unit
+
+    - name: Reload systemd daemon if unit files changed
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: nfs_csi_quota_service_unit.changed or nfs_csi_quota_timer_unit.changed
+
+    - name: Enable and start quota sync timer
+      ansible.builtin.systemd:
+        name: nfs-csi-quota-sync.timer
+        enabled: true
+        state: started
+
+# ==========================================================
+# METRICS (node_exporter textfile collector)
+# ==========================================================
+- name: Metrics
+  tags: [nfs_csi_quota, nfs-csi-quota-metrics]
+  when: (nfs_csi_quota_metrics_enabled | default(true)) | bool
+  block:
+    - name: Ensure textfile collector directory exists
+      ansible.builtin.file:
+        path: "{{ nfs_csi_quota_textfile_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Check node_exporter unit carries textfile collector flag
+      ansible.builtin.shell: "set -o pipefail; grep -q 'collector.textfile.directory' /etc/systemd/system/node_exporter.service"
+      args:
+        executable: /bin/bash
+      register: nfs_csi_quota_ne_flag
+      changed_when: false
+      failed_when: false
+
+    - name: Warn if node_exporter lacks textfile collector
+      ansible.builtin.debug:
+        msg: >-
+          WARN: node_exporter is not configured with
+          --collector.textfile.directory={{ nfs_csi_quota_textfile_dir }}.
+          nfs_csi_quota_* metrics will not be exposed until it is.
+      when: nfs_csi_quota_ne_flag.rc != 0
+
+# ==========================================================
+# VERIFY
+# ==========================================================
+- name: Verify
+  tags: [nfs_csi_quota, nfs-csi-quota-verify]
+  block:
+    - name: Run initial quota sync
+      ansible.builtin.systemd:
+        name: nfs-csi-quota-sync.service
+        state: started
+
+    - name: Report project quota state
+      ansible.builtin.command: "repquota -P -s {{ nfs_csi_quota_export_path }}"
+      register: nfs_csi_quota_report
+      changed_when: false
+
+    - name: Show quota report
+      ansible.builtin.debug:
+        msg: "{{ nfs_csi_quota_report.stdout_lines }}"

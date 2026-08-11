@@ -1,0 +1,57 @@
+---
+# RBAC (ServiceAccount/ClusterRole/ClusterRoleBinding/Secret) is applied
+# separately — see manifests/rbac/ in this repo's root, or your own
+# GitOps tooling. This task only reads the resulting Secret and renders
+# the local kubeconfig the sync script uses.
+- name: Build pv-reader kubeconfig from the cluster-managed secret
+  when: (nfs_csi_quota_rbac_read_enabled | default(false)) | bool
+  tags: [nfs_csi_quota, nfs-csi-quota-rbac]
+  delegate_to: "{{ nfs_csi_quota_k8s_delegate }}"
+  block:
+    - name: Read nfs-csi-quota-reader-token secret
+      ansible.builtin.command: >
+        kubectl --kubeconfig={{ nfs_csi_quota_admin_kubeconfig }}
+        -n kube-system get secret nfs-csi-quota-reader-token -o json
+      register: nfs_csi_quota_secret
+      until: (nfs_csi_quota_secret.stdout | from_json).data.token is defined
+      retries: 10
+      delay: 3
+      changed_when: false
+      no_log: true
+      failed_when: >-
+        nfs_csi_quota_secret.rc != 0 or
+        'NotFound' in nfs_csi_quota_secret.stderr
+
+    - name: Extract token/CA
+      ansible.builtin.set_fact:
+        nfs_csi_quota_sa_token_b64: "{{ (nfs_csi_quota_secret.stdout | from_json).data.token }}"
+        nfs_csi_quota_sa_ca_b64: "{{ (nfs_csi_quota_secret.stdout | from_json).data['ca.crt'] }}"
+      no_log: true
+
+  rescue:
+    - name: Explain the likely cause and stop
+      ansible.builtin.fail:
+        msg: >-
+          Could not read secret/nfs-csi-quota-reader-token in kube-system.
+          Apply manifests/rbac/ to this cluster first
+          (kubectl apply -f manifests/rbac/) — this role does not create
+          that RBAC itself.
+
+- name: Ensure pv-reader kubeconfig directory exists
+  ansible.builtin.file:
+    path: "{{ nfs_csi_quota_kubeconfig | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  tags: [nfs_csi_quota, nfs-csi-quota-rbac]
+
+- name: Render pv-reader kubeconfig on the NFS server
+  ansible.builtin.template:
+    src: pv-reader.conf.j2
+    dest: "{{ nfs_csi_quota_kubeconfig }}"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  tags: [nfs_csi_quota, nfs-csi-quota-rbac]

@@ -1,0 +1,58 @@
+# Example alert rules for the metrics this project emits.
+# Written for VictoriaMetrics' VMRule CRD; the PromQL expressions work
+# unchanged as plain Prometheus/Alertmanager rules too — just wrap them
+# in a standard `PrometheusRule` instead.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMRule
+metadata:
+  name: nfs-csi-quota-alerts
+  namespace: monitoring
+spec:
+  groups:
+    - name: nfs-csi-quota
+      rules:
+        # Only reachable in "alert" mode — in "enforce" mode the kernel
+        # caps usage at the hard limit, so this ratio can never exceed 1.
+        - alert: NFSCSIQuotaPVCOverDeclaredSize
+          expr: |
+            (nfs_csi_quota_used_bytes / nfs_csi_quota_limit_bytes > 1)
+            * on(projid) group_left(namespace, pvc) nfs_csi_quota_info
+          for: 5m
+          labels: {severity: critical}
+          annotations:
+            summary: "PVC {{ $labels.namespace }}/{{ $labels.pvc }} exceeds its declared size"
+
+        - alert: NFSCSIQuotaPVCNearFull
+          expr: |
+            (nfs_csi_quota_used_bytes / nfs_csi_quota_limit_bytes > 0.80)
+            * on(projid) group_left(namespace, pvc) nfs_csi_quota_info
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: "PVC {{ $labels.namespace }}/{{ $labels.pvc }} at {{ $value | humanizePercentage }} of declared size"
+
+        # In enforce mode, "at limit" is your practical proxy for
+        # "this workload is very likely hitting EDQUOT right now" — there
+        # is no direct EDQUOT-occurred metric without extra instrumentation.
+        - alert: NFSCSIQuotaPVCAtLimit
+          expr: |
+            (nfs_csi_quota_used_bytes / nfs_csi_quota_limit_bytes >= 0.99)
+            * on(projid) group_left(namespace, pvc) nfs_csi_quota_info
+          for: 5m
+          labels: {severity: critical}
+          annotations:
+            summary: "PVC {{ $labels.namespace }}/{{ $labels.pvc }} is pinned at its quota limit"
+
+        - alert: NFSCSIQuotaMetricsAbsent
+          expr: absent(nfs_csi_quota_used_bytes)
+          for: 15m
+          labels: {severity: warning}
+          annotations:
+            summary: "Per-PVC quota metrics missing — check the sync timer and node_exporter textfile collector"
+
+        - alert: NFSCSIQuotaKubeAPIUnreachable
+          expr: nfs_csi_quota_kubeapi_up == 0
+          for: 5m
+          labels: {severity: critical}
+          annotations:
+            summary: "{{ $labels.instance }} cannot reach the Kubernetes API — new/resized PVC limits will not update"

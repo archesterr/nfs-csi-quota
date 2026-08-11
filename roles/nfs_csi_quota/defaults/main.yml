@@ -1,0 +1,71 @@
+---
+nfs_csi_quota_enabled: false
+
+# alert   = accounting only, limits stay 0 (no EDQUOT, metrics/alerts only)
+# enforce = hard limit == PVC size (writes past capacity fail with EDQUOT)
+#
+# Recommended rollout: start in "alert", let it run for at least one full
+# retention/growth cycle of your largest workload, confirm nothing is
+# already over its declared PVC size (repquota -P), THEN switch to
+# "enforce". Flipping straight to enforce on a volume that's already grown
+# past its PVC size will crash-loop that workload the moment the hard
+# limit lands — see docs/incident-postmortem.md.
+nfs_csi_quota_mode: "alert"
+
+nfs_csi_quota_export_path: "/mnt/nfs"
+nfs_csi_quota_lv_path: "/dev/nfs-vg/nfs-lv"
+
+# fstab/mount options once ext4 project quota is enabled
+nfs_csi_quota_mount_opts: "defaults,prjquota"
+
+# Enabling prjquota on an existing filesystem requires: stop the NFS
+# service, unmount, e2fsck, tune2fs -O project,quota, remount. This is
+# real downtime for every client with a hard mount. Never done implicitly.
+nfs_csi_quota_allow_offline_enable: false
+
+# Read-only kubeconfig (PersistentVolumes get/list only). Rendered by this
+# role from the Secret that manifests/rbac/ creates via your own GitOps
+# tooling (or `kubectl apply -f manifests/rbac/`) — this role does NOT
+# create the RBAC itself; see README "Architecture".
+nfs_csi_quota_kubeconfig: /root/.kube/nfs-csi-quota-reader.conf
+nfs_csi_quota_csi_driver: "nfs.csi.k8s.io"
+
+# systemd timer cadence
+nfs_csi_quota_sync_interval: "5min"
+nfs_csi_quota_sync_boot_delay: "2min"
+
+# kubectl --request-timeout on every call in the sync script. Bounds how
+# long an unreachable API server can stall a tick.
+nfs_csi_quota_kubectl_timeout: "10s"
+
+# node_exporter textfile metrics (nfs_csi_quota_*)
+nfs_csi_quota_metrics_enabled: true
+nfs_csi_quota_textfile_dir: /var/lib/node_exporter/textfile
+
+# -----------------------------
+# kubectl binary
+# -----------------------------
+nfs_csi_quota_kubectl_install_enabled: true
+nfs_csi_quota_kube_version: "1.31.4"   # MUST match your cluster's minor (client skew ±1)
+nfs_csi_quota_image_arch: "amd64"
+# Default points at the official upstream release; override to an internal
+# mirror if your NFS server has no direct internet access.
+nfs_csi_quota_kubectl_download_url: "https://dl.k8s.io/release/v{{ nfs_csi_quota_kube_version }}/bin/linux/{{ nfs_csi_quota_image_arch }}/kubectl"
+nfs_csi_quota_kubectl_bin_path: /usr/local/bin/kubectl
+
+# -----------------------------
+# pv-reader kubeconfig bootstrap
+# RBAC (ServiceAccount/ClusterRole/ClusterRoleBinding/Secret — see
+# manifests/rbac/) is applied to the cluster separately from this role,
+# by whatever tooling manages your cluster manifests. This role only
+# READS the resulting Secret and renders the kubeconfig locally.
+# admin_kubeconfig is used only for that read, delegated to a master node.
+# -----------------------------
+nfs_csi_quota_rbac_read_enabled: false
+nfs_csi_quota_k8s_delegate: "{{ groups['nfs_csi_quota_masters'][0] | default(inventory_hostname) }}"
+nfs_csi_quota_admin_kubeconfig: /etc/kubernetes/admin.conf
+nfs_csi_quota_api_server: "https://{{ nfs_csi_quota_k8s_delegate }}:6443"
+# Set only if the API endpoint's DNS name isn't covered by the apiserver
+# certificate's SANs — you'll see a clear x509 error naming the valid
+# SANs if so; use one of those.
+nfs_csi_quota_api_tls_server_name: ""

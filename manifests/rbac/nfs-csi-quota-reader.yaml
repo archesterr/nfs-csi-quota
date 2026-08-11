@@ -1,0 +1,44 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nfs-csi-quota-reader
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: nfs-csi-quota
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: nfs-csi-quota-pv-reader
+  labels:
+    app.kubernetes.io/name: nfs-csi-quota
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: nfs-csi-quota-reader
+  labels:
+    app.kubernetes.io/name: nfs-csi-quota
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: nfs-csi-quota-pv-reader
+subjects:
+  - kind: ServiceAccount
+    name: nfs-csi-quota-reader
+    namespace: kube-system
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nfs-csi-quota-reader-token
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: nfs-csi-quota
+  annotations:
+    kubernetes.io/service-account.name: nfs-csi-quota-reader
+type: kubernetes.io/service-account-token

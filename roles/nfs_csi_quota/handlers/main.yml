@@ -1,0 +1,6 @@
+---
+- name: restart nfs-csi-quota-sync
+  ansible.builtin.systemd:
+    name: nfs-csi-quota-sync.service
+    state: restarted
+    daemon_reload: true

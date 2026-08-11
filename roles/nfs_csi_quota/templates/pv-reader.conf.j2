@@ -1,0 +1,18 @@
+# {{ ansible_managed }}
+apiVersion: v1
+kind: Config
+clusters:
+- name: cluster
+  cluster:
+    server: {{ nfs_csi_quota_api_server }}
+{% if (nfs_csi_quota_api_tls_server_name | default('')) | length > 0 %}
+    tls-server-name: {{ nfs_csi_quota_api_tls_server_name }}
+{% endif %}
+    certificate-authority-data: {{ nfs_csi_quota_sa_ca_b64 }}
+contexts:
+- name: ctx
+  context: {cluster: cluster, user: nfs-csi-quota-reader}
+current-context: ctx
+users:
+- name: nfs-csi-quota-reader
+  user: {token: {{ nfs_csi_quota_sa_token_b64 | b64decode }}}

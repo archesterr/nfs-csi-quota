@@ -1,0 +1,11 @@
+---
+- hosts: nfs_servers
+  become: true
+  roles:
+    - role: nfs_csi_quota
+      vars:
+        nfs_csi_quota_enabled: true
+        nfs_csi_quota_mode: alert   # switch to enforce only after reading docs/enforce-mode-checklist.md
+        nfs_csi_quota_rbac_read_enabled: true
+        nfs_csi_quota_api_server: "https://YOUR-API-ENDPOINT:6443"
+        nfs_csi_quota_kube_version: "1.31.4"   # match your cluster's minor

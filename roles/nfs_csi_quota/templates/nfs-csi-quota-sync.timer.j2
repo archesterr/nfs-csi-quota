@@ -1,0 +1,11 @@
+# {{ ansible_managed }}
+[Unit]
+Description=PVC quota sync every {{ nfs_csi_quota_sync_interval }}
+
+[Timer]
+OnBootSec={{ nfs_csi_quota_sync_boot_delay }}
+OnUnitActiveSec={{ nfs_csi_quota_sync_interval }}
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,9 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Sync PVC quotas to ext4 project quotas
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/nfs-csi-quota-sync.sh
