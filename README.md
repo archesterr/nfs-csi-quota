@@ -45,7 +45,7 @@ Every sync tick writes Prometheus-format metrics to `/var/lib/node_exporter/text
 - `nfs_csi_quota_info{projid,pv,namespace,pvc}` — join label
 - `nfs_csi_quota_kubeapi_up` — is the sync script reaching the API server
 
-Point node_exporter at that directory (`--collector.textfile.directory=...`), scrape the NFS server as a static target (it's outside the cluster), done. Example alert rules: [`manifests/alerts-example.yaml`](manifests/alerts-example.yaml).
+Point node_exporter at that directory (`--collector.textfile.directory=...`), scrape the NFS server as a static target (it's outside the cluster), done. Example alert rules: [`manifests/alerts-example.yaml`](manifests/alerts-example.yaml) — including a pattern for alerting on the NFS server's own exporter reachability without false-positiving on scrape blips (a real risk for any statically-scraped, out-of-cluster target).
 
 ## Key variables
 

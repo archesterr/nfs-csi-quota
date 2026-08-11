@@ -56,3 +56,41 @@ spec:
           labels: {severity: critical}
           annotations:
             summary: "{{ $labels.instance }} cannot reach the Kubernetes API — new/resized PVC limits will not update"
+
+        # ------------------------------------------------------------
+        # node_exporter reachability for the NFS server itself.
+        #
+        # This host is outside the cluster, so it's never covered by
+        # Kubernetes service discovery (ServiceMonitor/PodMonitor) —
+        # it has to be a static scrape target. A naive "up == 0"
+        # alert on a statically-scraped external target false-positives
+        # far more than an in-cluster one: no pod restart to distinguish
+        # from a real outage, and blips in the scrape path (a gateway
+        # reload, a brief network hiccup) look identical to the host
+        # actually being down. Two things make this alert trustworthy
+        # instead of noisy:
+        #
+        #   1. Scope it to instances that actually run this role —
+        #      match on a label this project's own metrics already
+        #      carry (nfs_csi_quota_info), so the alert only ever
+        #      evaluates against hosts that are supposed to be up,
+        #      never a stale/renamed/decommissioned target.
+        #
+        #   2. keep_firing_for: absorb single-scrape blips without
+        #      widening `for:` (which would slow down genuine outage
+        #      detection too). The alert only stays cleared if `up`
+        #      is actually healthy for the full keep_firing_for
+        #      window, not just for one lucky scrape.
+        - alert: NFSCSIQuotaExporterDown
+          expr: |
+            up{job="node-exporter"} == 0
+            and on(instance) count(nfs_csi_quota_info) by (instance) > 0
+          for: 5m
+          keep_firing_for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: "node_exporter on NFS server {{ $labels.instance }} is unreachable"
+            description: >-
+              {{ $labels.instance }} runs nfs-csi-quota but its node_exporter
+              target has been down for 5m+. If this stays firing, per-PVC
+              quota metrics for this host are also blind during the outage.
